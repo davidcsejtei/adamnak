@@ -214,6 +214,123 @@ Te: "mehet élesre"
   → release-manager (ha schema / Convex változott — ők hívják egymást)
 ```
 
+## Ha LLM nélkül akarsz deployolni preview-ra vagy prodra
+
+Az alábbi a subagentek által csinált lépések manuális megfelelője — pont
+ugyanazokat a parancsokat futtatod, csak te vezényled.
+
+### Egyszeri setup (gépenként egyszer)
+
+```bash
+npm install -g vercel        # ha még nincs CLI
+vercel login                 # böngészős OAuth
+vercel link                  # a repó hozzárendelése a Vercel projekthez
+```
+
+A Convex CLI a `npx convex …` formában fut, külön telepítés nem kell.
+
+### Preview deploy (feature branch → Vercel Preview)
+
+A Vercel Git integráció minden pushra automatikusan buildet csinál a branchről,
+és a build a `vercel.json` szerint a Convexbe is push-ol egy preview deploymentet.
+
+```bash
+git checkout -b iter/YYYYMMDD-<rovid-leiras>   # új ág main-ről
+# … fejlesztés, commitok …
+git push -u origin HEAD                         # ez indítja el a Preview buildet
+```
+
+Ezután a build URL-jét a Vercel dashboardban (vagy az adott branch GitHub PR-jában)
+találod. Ha közvetlenül akarod a preview URL-t, futtathatod kézzel is:
+
+```bash
+vercel                       # preview deploy a jelenlegi munkaállapotból
+```
+
+### Production deploy
+
+A pipe-line három lépés: **(1) Convex prod push → (2) szükséges seederek/migrációk
+→ (3) Vercel prod build**. Ha schema változott, a sorrend kötelező — előbb a Convex,
+hogy a frontend már a friss API-t kapja.
+
+1. **Lokális validáció** (a Vercel build is leáll, ha bármi bukik):
+
+   ```bash
+   npx tsc --noEmit
+   npm run lint
+   npm run build
+   ```
+
+2. **Convex prod deploy** — séma + függvények:
+
+   ```bash
+   npx convex deploy --prod
+   ```
+
+   Schema validation hiba esetén **ne** add hozzá a `--typecheck-components=false`
+   vagy hasonló silence flageket — javítsd a sémát / migrációt.
+
+3. **Migráció / seeder, ha szükséges**. Példa erre a repóra (üres prod tábla
+   felseedelése):
+
+   ```bash
+   npx convex run customers:seedIfEmpty --prod
+   ```
+
+   Az ilyen mutationök idempotensek (jelen `seedIfEmpty` korán visszatér, ha már
+   van adat), így újra futtatás biztonságos.
+
+4. **Vercel prod env vars ellenőrzése.** Kötelező minimum:
+
+   ```bash
+   vercel env ls production
+   ```
+
+   Tartalmaznia kell: `NEXT_PUBLIC_CONVEX_URL` (a prod Convex URL), `CONVEX_DEPLOY_KEY`.
+   Hiányzó var hozzáadása:
+
+   ```bash
+   vercel env add NEXT_PUBLIC_CONVEX_URL production
+   # paste a prod URL-t, pl. https://outstanding-blackbird-570.eu-west-1.convex.cloud
+   ```
+
+5. **Vercel prod deploy.** Kétféle mód:
+
+   - **Új build a jelenlegi commit-ből:**
+
+     ```bash
+     vercel --prod
+     ```
+
+   - **Egy validált preview promótálása prodba** (ajánlott, mert ugyanaz a
+     artifact, amit teszteltél):
+
+     ```bash
+     vercel promote <preview-deployment-url>
+     ```
+
+6. **Smoke-teszt.** Nyisd meg a prod URL-t, vagy gyors HTTP check:
+
+   ```bash
+   curl -I https://<a-projekt>.vercel.app
+   ```
+
+### Rollback
+
+- **Vercel**: `vercel rollback <deployment-url>` — visszaaliasolja a prod domaint
+  egy korábbi (még élő) buildre.
+- **Convex**: nincs egy-parancsos rollback. Tartsd meg az előző verzió
+  commitját, és deploy-old újra: `git checkout <prev-sha> && npx convex deploy --prod`.
+  Adatváltozás visszaforgatásához használj kompenzáló mutationt vagy a backupot
+  (`npx convex export --prod` előzetesen).
+
+### Mire jó a `release-manager` / `vercel-deployer` agent
+
+Ugyanezt csinálják, csak fejből végigmennek a pre-flight checklisten (séma diff,
+backfill kérdés, env var sanity, build log figyelés, post-deploy spot-check) és
+megállnak, ha valami nem kerek. Ha kézzel deploy-olsz, te vagy felelős ezekért
+a lépésekért.
+
 ## További olvasmány
 
 - Convex + Next.js: <https://docs.convex.dev/quickstart/nextjs>
