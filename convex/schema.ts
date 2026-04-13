@@ -6,4 +6,11 @@ export default defineSchema({
     text: v.string(),
     isCompleted: v.boolean(),
   }),
+  customers: defineTable({
+    name: v.string(),
+    address: v.string(),
+    searchText: v.string(),
+  }).searchIndex("search_text", {
+    searchField: "searchText",
+  }),
 });
