@@ -85,6 +85,135 @@ Lépések:
 | `npm run build:vercel` | Convex prod deploy + Next.js build (Vercel ezt futtatja) |
 | `npx convex dashboard` | Megnyitja a Convex dashboardot                           |
 
+## Claude Code subagentek
+
+A projekt `.claude/agents/` mappájában három specializált subagent él. Mindegyik
+szigorú "mikor mondjon nemet" szabályokkal dolgozik — inkább megállnak és
+kérdeznek, mint hogy rosszat csináljanak.
+
+### `iteration-brancher` — branch életciklus
+
+**Mikor fusson:** bármely új feladat / feature / kísérlet kezdetén, és akkor,
+amikor egy iterációt preview-ra kell küldeni. Két módban dolgozik:
+
+- **A mód — új iteráció indítása.** Trigger: "új iteráció", "új feature",
+  "kezdjünk újat", "new branch", stb. Lépések:
+  1. `git status` — ha `main`-en piszkos a fa, leáll és kérdez (stash / discard /
+     rescue branch / abort).
+  2. `git checkout main && git pull --ff-only origin main`. Ha a ff-only pull
+     elbukik, megáll — nem rebase-el, nem force-ol.
+  3. Bekéri a feladat rövid leírását, slugifyeli (ékezetek le, kisbetű, `-`),
+     és `iter/YYYYMMDD-<slug>` névre hoz létre új branchet.
+  4. `git checkout -b ...` — **push nélkül**. A branch csak lokálisan létezik.
+
+- **B mód — preview-ra küldés.** Trigger: "mehet a preview-ra", "tolhatod",
+  "ship to preview". Lépések:
+  1. Ellenőrzi, hogy nem `main`-en vagy.
+  2. `git status` + `git diff --stat`; secret-gyanús fájlokat (`.env*`,
+     `*.pem`, `*credentials*`) külön megerősít.
+  3. Név szerint stagelget (alapból nem `git add -A`), majd rákérdez, ha a teljes
+     fát kell committolni.
+  4. Commit üzenetet javasol (≤70 kar. subject, magyar ha a beszélgetés magyar),
+     a felhasználó jóváhagyása után committol. Pre-commit hook bukás esetén
+     **új commitot** csinál — sosem `--amend`, `--no-verify`.
+  5. `git push -u origin HEAD` — ez indítja el a Vercel Preview buildet +
+     a hozzá tartozó Convex preview deploymentet.
+
+**Refuzál, ha:** piszkos `main`, ff-only pull bukik, `main`-en próbálnál
+pusholni, secret-fájl készül committolódni, branch-név ütközik.
+
+### `vercel-deployer` — frontend prod deploy Vercelre
+
+**Mikor fusson:** amikor a Next.js appot élesre (Production) akarod küldeni
+Vercelen — vagy egy validált preview-t promótálni prodba.
+
+**Fontos csapda:** a `vercel.json` build parancsa `npx convex deploy --cmd 'next build'`,
+vagyis egy Vercel prod deploy **egyszerre Convex prodba is pushol**. Ha vannak
+függőben lévő schema változások, az agent megáll és a `release-manager`-höz
+irányít.
+
+Lépések:
+1. **Pre-flight.** `git status` tiszta-e, `git log origin/main..HEAD` mit
+   szállítanánk, `convex/schema.ts` diff a legutóbbi release óta.
+2. **Lokális validáció** (megállás az első hibán): `npx tsc --noEmit` →
+   `npm run lint` → `npm run build`.
+3. **Env sanity check.** `.vercel/project.json` létezik-e (ha nem:
+   `vercel link`). `vercel env ls production` — kötelező minimum:
+   `NEXT_PUBLIC_CONVEX_URL` (prod URL!), `CONVEX_DEPLOY_KEY`, minden kódban
+   használt `NEXT_PUBLIC_*`.
+4. **Preview először.** `vercel` (--prod nélkül) → preview URL → a
+   felhasználó smoke-teszteli → ACK.
+5. **Production.** Csak ACK után: `vercel --prod`. Build logban figyeli a
+   beágyazott `convex deploy` lépést. Ha Convex elutasítja a schema push-t,
+   szó szerint jelenti a hibát — **nem** ad semmilyen "silence" flaget.
+6. **Post-flight.** Prod URL GET, Convex adat renderel-e, majd jelentés:
+   deployment ID, prod URL, preview URL, commit SHA, verzió, build időtartam.
+
+**Refuzál, ha:** piszkos fa, bukott tsc/lint/build, függő schema változás
+(→ `release-manager`), hiányzó prod env var, "skippeljük a preview-t"
+kérés, `--force` / biztonsági flag kikapcsolás.
+
+### `release-manager` — Convex production release (adatvédelemmel)
+
+**Mikor fusson:** Convex production deployment — különösen ha a
+`convex/schema.ts` változott. Az agent egyetlen célja: **élő adat elvesztése
+nélkül** kiadni egy verziót. Schema-változás esetén migrációt és backfill-t
+követel, és mielőtt bármihez nyúlna, rákérdez a létező sorok populálására.
+
+Lépések:
+1. **Pre-flight.** `git log origin/main..HEAD`, `convex/schema.ts` diff a
+   legutóbbi release tag óta. Minden változás felsorolva: új tábla, új mező
+   (opt / required), eltávolított mező, átnevezés, típusváltás, index mozgás.
+2. **Kockázati besorolás.**
+   - *Additív, opcionális*: biztonságos, de a felhasználótól megkérdezi, kell-e
+     backfill.
+   - *Additív, required*: csak migráció után engedheti a schemának required-re
+     váltani.
+   - *Eltávolítás / átnevezés*: kötelező kétfázisú migráció (writes both →
+     backfill → drop).
+   - *Típusváltás*: olvas-régi-ír-új migráció, átmeneti dual validátor.
+3. **Backfill kérdezés.** Minden új/változó mezőre `AskUserQuestion`-nel: "Mi
+   legyen a létező sorok értéke? (a) hagyjuk opcionálisnak, (b) konstans default
+   (mi legyen?), (c) másik mezőből számolva (mi a logika?), (d) egyéb." Nincs
+   továbbhaladás válasz nélkül.
+4. **Migrációk & seederek.**
+   - `convex/migrations/` — minden migráció `internalMutation`, **idempotens**,
+     **lapozott** (sose húz be egy egész táblát memóriába), támogatja a
+     dry-run / count-only módot.
+   - `convex/seeders/` — prod seeder csak kiegészíthet, sose ír felül (`if
+     (existing) return;`).
+5. **Backup.** Destruktív migráció előtt: `npx convex export --prod --path
+   ./backups/<timestamp>/`. Nem üres fájl → indulhat.
+6. **Deploy.** `npx convex deploy --prod`. Schema validation errort szó szerint
+   jelent — **nem** használ `--typecheck-components=false` flaget. Schema push
+   után dry-run migráció → user review → élesben futtatás → végül seederek (ha
+   kellenek).
+7. **Post-flight.** Spot-check mintasorok a migrált táblákból, row count
+   összehasonlítás (in-place migrationnél egyezniük kell), végül összegző
+   jelentés: verzió, schema változások, row countok, backup útvonal, follow-upok.
+
+**Refuzál, ha:** "csak most az egyszer skippeljük a migrációt", required mezőt
+kér backfill terv nélkül, nem tud backupot készíteni, a schema fájl nem
+committolt, a felhasználó nem tud válaszolni a backfill kérdésre.
+
+### Tipikus iterációs körfolyamat
+
+```
+Te: "új feature, task szűrés státusz szerint"
+  → iteration-brancher (A mód) — iter/YYYYMMDD-task-szures létrehozva lokálban
+
+[fejlesztés, több commit vagy még egy sem — mindegy, lokális]
+
+Te: "mehet a preview-ra"
+  → iteration-brancher (B mód) — commit + push → Vercel Preview indul
+
+[preview URL-en teszt]
+
+Te: "mehet élesre"
+  → vercel-deployer (ha csak frontend változott)
+  → release-manager (ha schema / Convex változott — ők hívják egymást)
+```
+
 ## További olvasmány
 
 - Convex + Next.js: <https://docs.convex.dev/quickstart/nextjs>
