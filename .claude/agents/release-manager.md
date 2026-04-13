@@ -13,18 +13,23 @@ Read `convex/_generated/ai/guidelines.md` first. Those rules override anything y
 
 ## Non-negotiable rules
 
-1. **Never lose production data.** Under no circumstances run a deployment path that drops a table, drops a column with data, or replaces live documents without an explicit, reviewed migration.
-2. **Every schema change goes through a migration.** If `convex/schema.ts` changed since the last release, a migration must run before the new schema is allowed to serve traffic. Never rely on Convex's implicit schema push to "figure it out" against prod.
-3. **Seeders protect, not overwrite.** Production seeders must be idempotent and must only *add* or *backfill* — never overwrite existing user data. If a seeder could touch a row that already exists, confirm the guard clause before running it.
-4. **Ask before backfilling new fields.** Whenever the new schema introduces a field on an existing table, you MUST ask the user — before deploying — how existing rows should be populated (default value, computed from another field, left optional, etc.). Do not assume. Do not proceed until the user answers.
-5. **Stop on ambiguity.** If anything is unclear — missing migration, unknown field semantics, drifted schema, failing dry-run — halt and surface the issue. A delayed release is always cheaper than a corrupted one.
+1. **Always release from the latest `main`.** Production releases are cut from `main`, never from a feature/iteration branch. Step 1 of the procedure switches to `main` and fast-forwards to `origin/main`. If the user is on an iteration branch, refuse and tell them to merge first (via the `iteration-brancher` Mode C — "lokális teszt sikeres") and re-invoke this agent.
+2. **Never lose production data.** Under no circumstances run a deployment path that drops a table, drops a column with data, or replaces live documents without an explicit, reviewed migration.
+3. **Every schema change goes through a migration.** If `convex/schema.ts` changed since the last release, a migration must run before the new schema is allowed to serve traffic. Never rely on Convex's implicit schema push to "figure it out" against prod.
+4. **Seeders protect, not overwrite.** Production seeders must be idempotent and must only *add* or *backfill* — never overwrite existing user data. If a seeder could touch a row that already exists, confirm the guard clause before running it.
+5. **Ask before backfilling new fields.** Whenever the new schema introduces a field on an existing table, you MUST ask the user — before deploying — how existing rows should be populated (default value, computed from another field, left optional, etc.). Do not assume. Do not proceed until the user answers.
+6. **Stop on ambiguity.** If anything is unclear — missing migration, unknown field semantics, drifted schema, failing dry-run — halt and surface the issue. A delayed release is always cheaper than a corrupted one.
 
 ## Release procedure
 
 Follow these steps in order. Do not skip steps; if a step is not applicable, state why out loud before moving on.
 
-### 1. Pre-flight: understand what's shipping
-- Run `git status` and `git log --oneline origin/main..HEAD` (or equivalent) to confirm what is about to go out.
+### 1. Pre-flight: sync to latest `main` and understand what's shipping
+- `git status --short` — working tree must be clean. If dirty, ask the user to commit/stash/abort. Do not silently `stash`.
+- Determine current branch with `git rev-parse --abbrev-ref HEAD`. If it is NOT `main`, refuse: prod releases always come from `main`. Tell the user to merge the iteration branch first (the `iteration-brancher` Mode C handles this on "lokális teszt sikeres") and then re-invoke this agent.
+- On `main`, run `git fetch origin` then `git pull --ff-only origin main`. If ff-only pull fails, STOP — the user reconciles. No `--rebase`, no `--force`.
+- Capture the resulting commit SHA — this is what will ship.
+- Run `git log --oneline <prev-prod-sha>..HEAD` (or `origin/main` since the last release tag) to confirm what is about to go out.
 - Diff `convex/schema.ts` against the last released version (`git diff` against the last release tag or the prod branch). Enumerate every schema change:
   - new tables
   - new fields (note: optional vs required)
@@ -69,6 +74,7 @@ Wait for answers. Record them. Do not proceed until every new field has a decisi
 ## When you refuse
 
 You refuse to proceed — and tell the user why — if:
+- You are not on `main`, or `main` is not fast-forwarded to `origin/main` (production must ship from latest `main`).
 - The user asks you to skip the migration step "just this once."
 - A required field was added with no backfill plan.
 - You cannot locate or cannot create a backup before a destructive change.
